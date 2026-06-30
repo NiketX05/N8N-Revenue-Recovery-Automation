@@ -1,0 +1,2077 @@
+{
+  "name": "⚡ Failed Payments + Churn Saver v2.1",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "stripe-webhook-payments",
+        "responseMode": "responseNode",
+        "responseData": "allEntries",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Stripe Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        140,
+        500
+      ],
+      "webhookId": "stripe-payment-webhook"
+    },
+    {
+      "parameters": {
+        "content": "## 📋 START HERE — Read Notes\n\n1. Import this workflow\n2. Add your Stripe Webhook Secret\n3. Connect Supabase & SMTP\n4. Connect Slack (optional)\n5. Google Sheets (optional)\n\nSee `SETUP_GUIDE.md` for full instructions.",
+        "height": 220,
+        "width": 320,
+        "color": 6
+      },
+      "id": "sticky-note-setup",
+      "name": "📋 START HERE — Read Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        140,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## ⚠️ Set Error Workflow\n\nWithout this, ALL execution failures are silent — you will never know when the workflow breaks in production.\n\n**How to set it up:**\n1. Create a new n8n workflow called 'Error Handler'\n2. Add a Webhook trigger (or Error Trigger node)\n3. Add a Slack or Email node that sends you the error details\n4. Copy that workflow's ID from its URL\n5. In THIS workflow, go to Settings (top right) → Error Workflow → paste the ID\n\nSee: https://docs.n8n.io/flow-logic/error-handling/",
+        "height": 220,
+        "width": 320,
+        "color": 6
+      },
+      "id": "sticky-note-error-workflow",
+      "name": "⚠️ Set Error Workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        520,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// IMPROVEMENT: Validate required environment variables before any processing\nconst missingVars = [];\nif (!$env.STRIPE_SIGNING_SECRET) missingVars.push('STRIPE_SIGNING_SECRET');\nif (!$env.SUPABASE_URL) missingVars.push('SUPABASE_URL');\nif (!$env.SUPABASE_SERVICE_KEY) missingVars.push('SUPABASE_SERVICE_KEY');\nif (missingVars.length > 0) {\n  throw new Error('Missing required env vars: ' + missingVars.join(', '));\n}\nconst crypto = require('crypto');\nconst body = $input.first().json;\nconst sigHeader = body.headers['stripe-signature'] || '';\nconst secret = $env.STRIPE_SIGNING_SECRET || '';\nif (!sigHeader || !secret) {\n  return [{ json: { signatureValid: false, reason: 'Missing signature or secret' } }];\n}\ntry {\n  const elements = sigHeader.split(',');\n  const tsEl = elements.find(e => e.startsWith('t='));\n  const sigEl = elements.find(e => e.startsWith('v1='));\n  if (!tsEl || !sigEl) throw new Error('Malformed signature header');\n  const timestamp = tsEl.split('=')[1];\n  const signature = sigEl.split('=')[1];\n  const rawBody = typeof body.body === 'string' ? body.body : JSON.stringify(body.body);\n  const expected = crypto.createHmac('sha256', secret).update(timestamp + '.' + rawBody).digest('hex');\n  const isValid = crypto.timingSafeEqual(Buffer.from(signature, 'utf8'), Buffer.from(expected, 'utf8'));\n  const tolerance = 300;\n  const now = Math.floor(Date.now() / 1000);\n  const isFresh = Math.abs(now - parseInt(timestamp)) <= tolerance;\n  return [{ json: { signatureValid: isValid && isFresh, ...body } }];\n} catch (e) {\n  return [{ json: { signatureValid: false, reason: e.message, ...body } }];\n}"
+      },
+      "id": "verify-sig",
+      "name": "Verify Stripe Signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        500
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.signatureValid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-sig-valid",
+      "name": "IF: Signature Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        740,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "Invalid webhook — Stripe signature verification failed.",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "id": "reject-invalid",
+      "name": "Reject Invalid Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        740,
+        740
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst eventId = $input.first().json.body.id;\nconst eventType = $input.first().json.body.type || '';\nconst obj = $input.first().json.body.data?.object || {};\nconst sbUrl = $env.SUPABASE_URL;\nconst sbKey = $env.SUPABASE_SERVICE_KEY;\nconst headers = { 'apikey': sbKey, 'Authorization': 'Bearer ' + sbKey, 'Content-Type': 'application/json' };\nlet isDuplicate = false;\ntry {\n  // SECURITY: encodeURIComponent() prevents URL injection via eventId\n  const check = await this.helpers.httpRequest({ method: 'GET', url: sbUrl + '/rest/v1/payment_events?stripe_event_id=eq.' + encodeURIComponent(eventId) + '&select=id,status', headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey } });\n  if (check && check.length > 0) { isDuplicate = true; }\n  else {\n    await this.helpers.httpRequest({ method: 'POST', url: sbUrl + '/rest/v1/payment_events', headers, body: { stripe_event_id: eventId, event_type: eventType, status: 'processing', customer_id: obj.customer || '', invoice_id: obj.id || '', subscription_id: obj.subscription || '' } });\n  }\n} catch (e) { /* If DB fails, still process to avoid losing events */ }\nreturn [{ json: { isDuplicate, ...$input.first().json } }];"
+      },
+      "id": "idempotency-check",
+      "name": "Idempotency Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.isDuplicate }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-new-event",
+      "name": "IF: New Event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "Event already processed.",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "respond-dup",
+      "name": "Respond: Already Processed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1340,
+        740
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "Webhook received.",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "respond-ok",
+      "name": "Respond: Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1640,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.body.type }}",
+                    "rightValue": "invoice.payment_failed",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": "Payment Failed"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.body.type }}",
+                    "rightValue": "invoice.payment_succeeded",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": "Payment Recovered"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.body.type }}",
+                    "rightValue": "customer.subscription.deleted",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": "Subscription Cancelled"
+            }
+          ]
+        },
+        "options": {
+          "allMatchingOutputs": false
+        }
+      },
+      "id": "route-event",
+      "name": "Route by Event Type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        1940,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst event = $input.first().json.body;\nconst invoice = event.data.object;\nconst attemptCount = invoice.attempt_count || 1;\nlet failureStage, urgencyLevel, nextAction, slackUrgencyEmoji;\nif (attemptCount === 1) { failureStage='first_failure'; urgencyLevel='low'; nextAction='friendly_reminder'; slackUrgencyEmoji='🟡'; }\nelse if (attemptCount === 2) { failureStage='second_failure'; urgencyLevel='medium'; nextAction='update_card_request'; slackUrgencyEmoji='🟠'; }\nelse if (attemptCount === 3) { failureStage='third_failure'; urgencyLevel='high'; nextAction='urgent_warning'; slackUrgencyEmoji='🔴'; }\nelse { failureStage='final_failure'; urgencyLevel='critical'; nextAction='cancellation_warning'; slackUrgencyEmoji='💀'; }\nconst amountDue = (invoice.amount_due || 0) / 100;\nconst currency = (invoice.currency || 'usd').toUpperCase();\n// BUG FIX: Null-safe fallback chain — handles missing customer object gracefully\nconst customerEmail = invoice.customer_email || invoice.customer?.email || '';\nconst customerName = invoice.customer_name || (invoice.customer && typeof invoice.customer === 'object' ? invoice.customer.name : null) || (customerEmail ? customerEmail.split('@')[0] : 'Customer');\nconst customerId = invoice.customer || '';\nconst subscriptionId = invoice.subscription || '';\nconst invoiceId = invoice.id || '';\nconst cardUpdateUrl = $env.STRIPE_PORTAL_URL || 'https://billing.stripe.com/p/login/YOUR_PORTAL_ID';\n// IMPROVEMENT: Email validation — flag invalid emails rather than sending to bad addresses\nconst emailValid = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(customerEmail);\n// Failure reason mapping\nconst codeMap = { card_declined:'Your card was declined by the bank', insufficient_funds:'Insufficient funds on card', expired_card:'Your card has expired', incorrect_cvc:'Incorrect CVC code entered', processing_error:'Temporary processing error' };\nlet failureReason = 'unknown', failureCode = '';\nif (invoice.last_finalization_error) { failureReason = invoice.last_finalization_error.message || 'Payment method declined'; failureCode = invoice.last_finalization_error.code || ''; }\nelse if (invoice.charge && typeof invoice.charge === 'object') { failureReason = invoice.charge.failure_message || 'Card declined'; failureCode = invoice.charge.failure_code || ''; }\nif (failureCode && codeMap[failureCode]) failureReason = codeMap[failureCode];\n// Segmentation (Task 8)\nlet revenueTier = 'low';\nif (amountDue >= 100) revenueTier = 'high';\nelse if (amountDue >= 20) revenueTier = 'mid';\n// IMPROVEMENT: Deterministic A/B testing — hash-based, consistent per customer across retries\nconst templateVariant = parseInt((customerId || '').slice(-1), 16) % 2 === 0 ? 'A' : 'B';\nreturn [{ json: { customerEmail, customerName, customerId, subscriptionId, invoiceId, amountDue, currency, attemptCount, failureStage, urgencyLevel, nextAction, failureReason, failureCode, cardUpdateUrl, invoiceUrl: invoice.hosted_invoice_url || '', eventId: event.id, eventTimestamp: new Date((event.created||0)*1000).toISOString(), processedAt: new Date().toISOString(), revenueTier, templateVariant, emailValid, slackUrgencyEmoji } }];"
+      },
+      "id": "classify-failure",
+      "name": "Classify Failure & Extract Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2280,
+        100
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst d = $input.first().json;\nconst sbUrl = $env.SUPABASE_URL; const sbKey = $env.SUPABASE_SERVICE_KEY;\nconst headers = { apikey: sbKey, Authorization: 'Bearer '+sbKey, 'Content-Type':'application/json', Prefer:'return=minimal' };\ntry { await this.helpers.httpRequest({ method:'POST', url: sbUrl+'/rest/v1/dunning_events', headers: {...headers, Prefer:'resolution=merge-duplicates,return=minimal'}, body: { stripe_invoice_id: d.invoiceId, stripe_subscription_id: d.subscriptionId, stripe_customer_id: d.customerId, customer_email: d.customerEmail, customer_name: d.customerName, amount_due: d.amountDue, currency: d.currency, failure_stage: d.failureStage, attempt_count: d.attemptCount, urgency_level: d.urgencyLevel, failure_reason: d.failureReason, failure_code: d.failureCode, revenue_tier: d.revenueTier, template_variant: d.templateVariant, status: 'PENDING_RECOVERY', stripe_event_id: d.eventId } }); } catch(e) {\n  try {\n    const sbUrl = $env.SUPABASE_URL;\n    const sbKey = $env.SUPABASE_SERVICE_KEY;\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: sbUrl + '/rest/v1/failed_integrations',\n      headers: {\n        apikey: sbKey,\n        Authorization: 'Bearer ' + sbKey,\n        'Content-Type': 'application/json',\n        Prefer: 'return=minimal'\n      },\n      body: {\n        operation_type: 'supabase_write',\n        node_name: 'Save Dunning to Supabase',\n        error_message: e.message || 'Unknown error',\n        payload: $input.first().json,\n        retry_count: 0,\n        status: 'failed'\n      }\n    });\n  } catch(innerErr) {\n    // Fail silently — never block main flow\n  }\n}\nreturn $input.all();"
+      },
+      "id": "save-dunning",
+      "name": "Save Dunning to Supabase",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2580,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.failureStage }}",
+                    "rightValue": "first_failure",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": "1st Failure"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.failureStage }}",
+                    "rightValue": "second_failure",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": "2nd Failure"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.failureStage }}",
+                    "rightValue": "third_failure",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": "3rd Failure"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.failureStage }}",
+                    "rightValue": "final_failure",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": "Final Failure"
+            }
+          ]
+        },
+        "options": {
+          "allMatchingOutputs": false
+        }
+      },
+      "id": "route-dunning",
+      "name": "Route Dunning Stage",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        2880,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "amount": "={{ $env.DUNNING_WAIT_STAGE_1 || '240' }}",
+        "unit": "minutes"
+      },
+      "id": "wait-1",
+      "name": "Wait: Stage 1",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3240,
+        -500
+      ],
+      "notes": "Timer starts when invoice.payment_failed webhook fires. Stage 1 = first dunning email delay. Default: 4 hours (240 min). Override with DUNNING_WAIT_STAGE_1 env var."
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst sbUrl = $env.SUPABASE_URL;\nconst sbKey = $env.SUPABASE_SERVICE_KEY;\n// IMPROVEMENT: Email validation — skip sending if customer email is invalid\nconst emailValid = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(d.customerEmail || '');\nlet stillPending = true;\ntry {\n  // SECURITY: encodeURIComponent() prevents URL injection via invoiceId\n  const res = await this.helpers.httpRequest({\n    method: 'GET',\n    url: sbUrl + '/rest/v1/dunning_events?stripe_invoice_id=eq.' + encodeURIComponent(d.invoiceId) + '&select=status&order=created_at.desc&limit=1',\n    headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey }\n  });\n  if (res && res.length > 0 && res[0].status !== 'PENDING_RECOVERY') {\n    stillPending = false;\n  }\n  if (stillPending) {\n    await this.helpers.httpRequest({\n      method: 'PATCH',\n      url: sbUrl + '/rest/v1/dunning_events?stripe_event_id=eq.' + encodeURIComponent(d.eventId),\n      headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey, 'Content-Type': 'application/json', Prefer: 'return=minimal' },\n      body: { failure_stage: d.failureStage }\n    });\n    await this.helpers.httpRequest({\n      method: 'PATCH',\n      url: sbUrl + '/rest/v1/dunning_events?stripe_invoice_id=eq.' + encodeURIComponent(d.invoiceId),\n      headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey, 'Content-Type': 'application/json', Prefer: 'return=minimal' },\n      body: { last_dunning_stage_reached: d.failureStage || null }\n    });\n  }\n} catch(e) {}\n// Skip sending if email is invalid — propagate emailValid flag\nreturn [{ json: { ...d, stillPending: stillPending && emailValid, emailValid } }];"
+      },
+      "id": "check-unpaid-1",
+      "name": "Check: Still Unpaid? (Stage 1)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3540,
+        -500
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c-still-pending-1",
+              "leftValue": "={{ $json.stillPending }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-still-pending-1",
+      "name": "IF: Still Pending? (Stage 1)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3840,
+        -500
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "console.log('[Skip] Invoice already recovered, skipping stage. invoiceId:', $input.first().json.invoiceId || 'unknown');\nreturn $input.all();"
+      },
+      "id": "skip-recovered-1",
+      "name": "Skip: Already Recovered (Stage 1)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4140,
+        -700
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SENDER_EMAIL || 'billing@yourcompany.com' }}",
+        "toEmail": "={{ $json.customerEmail }}",
+        "subject": "Your payment didn't go through — quick action needed",
+        "emailType": "html",
+        "html": "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"></head><body style=\"margin:0;padding:0;background-color:#f4f6f9;font-family:Arial,Helvetica,sans-serif;\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#f4f6f9;padding:40px 0;\"><tr><td align=\"center\"><table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.06);\"><tr><td style=\"background-color:#3b5bdb;padding:32px 40px;\"><h1 style=\"margin:0;color:#ffffff;font-size:22px;font-weight:700;\">Payment Update Required</h1></td></tr><tr><td style=\"padding:36px 40px 20px 40px;\"><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">Hi {{ $json.customerName }},</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">We attempted to process your payment of <strong>{{ $json.amountDue }} {{ $json.currency }}</strong>, but it didn't go through.</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">This is completely normal — it usually happens when a card expires, your bank runs a routine security check, or there's a temporary hold on the account. Nothing to worry about.</p><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:0 0 24px 0;\"><tr><td style=\"background-color:#edf2ff;border-left:4px solid #3b5bdb;padding:16px 20px;border-radius:4px;\"><p style=\"margin:0;font-size:14px;line-height:1.5;color:#364fc7;\">A quick card update is all it takes to get things sorted. It should take less than 30 seconds.</p></td></tr></table><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:0 auto 28px auto;\"><tr><td align=\"center\" style=\"background-color:#3b5bdb;border-radius:6px;\"><a href=\"{{ $json.cardUpdateUrl }}\" target=\"_blank\" style=\"display:inline-block;padding:14px 32px;color:#ffffff;font-size:16px;font-weight:600;text-decoration:none;\">Update Payment Details →</a></td></tr></table><p style=\"margin:0;font-size:14px;line-height:1.5;color:#888888;\">If you've already updated your payment method, you can safely ignore this email.</p></td></tr><tr><td style=\"padding:24px 40px;border-top:1px solid #eeeeee;\"><p style=\"margin:0;font-size:12px;line-height:1.5;color:#aaaaaa;text-align:center;\">You're receiving this because your subscription payment didn't process successfully.</p></td></tr></table></td></tr></table></body></html>",
+        "options": {
+          "replyTo": "={{ $env.REPLY_TO_EMAIL || 'support@yourcompany.com' }}"
+        }
+      },
+      "id": "email-1",
+      "name": "Email: Friendly Reminder (Variant A)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        4440,
+        -620
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "SMTP_CREDENTIAL_ID",
+          "name": "SMTP Account",
+          "_note": "REPLACE_WITH_YOUR_SMTP_CREDENTIAL_ID - Create SMTP credential in n8n first (Settings > Credentials)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "amount": "={{ $env.DUNNING_WAIT_STAGE_2 || '60' }}",
+        "unit": "minutes"
+      },
+      "id": "wait-2",
+      "name": "Wait: Stage 2",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3240,
+        -100
+      ],
+      "notes": "Timer starts when Stage 2 failure event (second invoice.payment_failed) arrives — NOT from when the Stage 1 email was sent. Default: 1 hour (60 min). Override with DUNNING_WAIT_STAGE_2 env var."
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SENDER_EMAIL || 'billing@yourcompany.com' }}",
+        "toEmail": "={{ $json.customerEmail }}",
+        "subject": "Second notice: Your payment is still failing",
+        "emailType": "html",
+        "html": "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"></head><body style=\"margin:0;padding:0;background-color:#f4f6f9;font-family:Arial,Helvetica,sans-serif;\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#f4f6f9;padding:40px 0;\"><tr><td align=\"center\"><table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.06);\"><tr><td style=\"background-color:#fd7e14;padding:32px 40px;\"><h1 style=\"margin:0;color:#ffffff;font-size:22px;font-weight:700;\">Payment Still Failing</h1></td></tr><tr><td style=\"padding:36px 40px 20px 40px;\"><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">Hi {{ $json.customerName }},</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">We tried to charge your card again for <strong>{{ $json.amountDue }} {{ $json.currency }}</strong>, but unfortunately the payment still didn't go through.</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">Your account is still fully active right now, but we do need this resolved soon to keep everything running smoothly for you.</p><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:0 0 24px 0;\"><tr><td style=\"background-color:#fff4e6;border-left:4px solid #fd7e14;padding:16px 20px;border-radius:4px;\"><p style=\"margin:0;font-size:14px;line-height:1.5;color:#e8590c;\"><strong>⚠️ Heads up:</strong> If the payment continues to fail, we'll need to pause your account to comply with our billing policy. We'd really rather not do that.</p></td></tr></table><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:0 auto 28px auto;\"><tr><td align=\"center\" style=\"background-color:#fd7e14;border-radius:6px;\"><a href=\"{{ $json.cardUpdateUrl }}\" target=\"_blank\" style=\"display:inline-block;padding:14px 32px;color:#ffffff;font-size:16px;font-weight:600;text-decoration:none;\">Update Payment Method →</a></td></tr></table><p style=\"margin:0;font-size:14px;line-height:1.5;color:#888888;\">Need help? Just reply to this email — a real person will get back to you.</p></td></tr><tr><td style=\"padding:24px 40px;border-top:1px solid #eeeeee;\"><p style=\"margin:0;font-size:12px;line-height:1.5;color:#aaaaaa;text-align:center;\">This is the second notice regarding your subscription payment of {{ $json.amountDue }} {{ $json.currency }}.</p></td></tr></table></td></tr></table></body></html>",
+        "options": {
+          "replyTo": "={{ $env.REPLY_TO_EMAIL || 'support@yourcompany.com' }}"
+        }
+      },
+      "id": "email-2",
+      "name": "Email: Update Card Request (Variant A)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        4440,
+        -220
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "SMTP_CREDENTIAL_ID",
+          "name": "SMTP Account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "amount": "={{ $env.DUNNING_WAIT_STAGE_3 || '1440' }}",
+        "unit": "minutes"
+      },
+      "id": "wait-3",
+      "name": "Wait: Stage 3",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3240,
+        300
+      ],
+      "notes": "Timer starts when Stage 3 failure event (third invoice.payment_failed) arrives — NOT from when the Stage 2 email was sent. Default: 24 hours (1440 min). Override with DUNNING_WAIT_STAGE_3 env var."
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SENDER_EMAIL || 'billing@yourcompany.com' }}",
+        "toEmail": "={{ $json.customerEmail }}",
+        "subject": "Your account is at risk — please act today",
+        "emailType": "html",
+        "html": "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"></head><body style=\"margin:0;padding:0;background-color:#f4f6f9;font-family:Arial,Helvetica,sans-serif;\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#f4f6f9;padding:40px 0;\"><tr><td align=\"center\"><table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.06);\"><tr><td style=\"background-color:#e03131;padding:32px 40px;\"><h1 style=\"margin:0;color:#ffffff;font-size:22px;font-weight:700;\">Action Required — Account Suspension Imminent</h1></td></tr><tr><td style=\"padding:36px 40px 20px 40px;\"><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">Hi {{ $json.customerName }},</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">We've now attempted to process your payment of <strong>{{ $json.amountDue }} {{ $json.currency }}</strong> multiple times without success. We need to hear from you today.</p><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:0 0 24px 0;\"><tr><td style=\"background-color:#fff5f5;border-left:4px solid #e03131;padding:16px 20px;border-radius:4px;\"><p style=\"margin:0 0 8px 0;font-size:14px;line-height:1.5;color:#c92a2a;\"><strong>🚨 Your account will be suspended if payment is not resolved.</strong></p><p style=\"margin:0;font-size:14px;line-height:1.5;color:#c92a2a;\">Here's what you'll lose access to:</p><ul style=\"margin:8px 0 0 0;padding-left:20px;font-size:14px;line-height:1.8;color:#c92a2a;\"><li>All active workflows and automations</li><li>Execution history and logs</li><li>Connected integrations and API keys</li><li>Saved templates and configurations</li></ul></td></tr></table><p style=\"margin:0 0 24px 0;font-size:16px;line-height:1.6;color:#333333;\">We genuinely do not want this to happen. Updating your payment method takes less than a minute and keeps everything running.</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:0 auto 28px auto;\"><tr><td align=\"center\" style=\"background-color:#e03131;border-radius:6px;\"><a href=\"{{ $json.cardUpdateUrl }}\" target=\"_blank\" style=\"display:inline-block;padding:14px 32px;color:#ffffff;font-size:16px;font-weight:600;text-decoration:none;\">Resolve Now — Keep My Account →</a></td></tr></table><p style=\"margin:0;font-size:14px;line-height:1.5;color:#888888;\">If there's a billing issue we can help with, please reply to this email and we'll work it out together.</p></td></tr><tr><td style=\"padding:24px 40px;border-top:1px solid #eeeeee;\"><p style=\"margin:0;font-size:12px;line-height:1.5;color:#aaaaaa;text-align:center;\">This is an urgent notice — your account will be paused if payment of {{ $json.amountDue }} {{ $json.currency }} is not received.</p></td></tr></table></td></tr></table></body></html>",
+        "options": {
+          "replyTo": "={{ $env.REPLY_TO_EMAIL || 'support@yourcompany.com' }}"
+        }
+      },
+      "id": "email-3",
+      "name": "Email: Urgent Warning (Variant A)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        4440,
+        180
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "SMTP_CREDENTIAL_ID",
+          "name": "SMTP Account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "amount": "={{ $env.DUNNING_WAIT_STAGE_4 || '4320' }}",
+        "unit": "minutes"
+      },
+      "id": "wait-4",
+      "name": "Wait: Stage 4",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3240,
+        700
+      ],
+      "notes": "Timer starts when Stage 4 failure event (fourth/final invoice.payment_failed) arrives — NOT from when the Stage 3 email was sent. Default: 72 hours (4320 min). Override with DUNNING_WAIT_STAGE_4 env var."
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SENDER_EMAIL || 'billing@yourcompany.com' }}",
+        "toEmail": "={{ $json.customerEmail }}",
+        "subject": "Your subscription has been paused — reactivate anytime",
+        "emailType": "html",
+        "html": "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"></head><body style=\"margin:0;padding:0;background-color:#f4f6f9;font-family:Arial,Helvetica,sans-serif;\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#f4f6f9;padding:40px 0;\"><tr><td align=\"center\"><table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.06);\"><tr><td style=\"background-color:#2e7d32;padding:32px 40px;\"><h1 style=\"margin:0;color:#ffffff;font-size:22px;font-weight:700;\">Your Subscription Has Been Paused</h1></td></tr><tr><td style=\"padding:36px 40px 20px 40px;\"><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">Hi {{ $json.customerName }},</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">After several attempts, we were unable to process your payment of <strong>{{ $json.amountDue }} {{ $json.currency }}</strong>, so your subscription has been paused.</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">There is absolutely no judgment here — life happens, cards expire, and sometimes things just slip through the cracks. We get it.</p><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:0 0 24px 0;\"><tr><td style=\"background-color:#e8f5e9;border-left:4px solid #2e7d32;padding:16px 20px;border-radius:4px;\"><p style=\"margin:0;font-size:14px;line-height:1.5;color:#2e7d32;\"><strong>✅ Your data is completely safe.</strong> Nothing has been deleted. All your workflows, history, and configurations are exactly where you left them. Whenever you're ready, you can pick up right where you left off.</p></td></tr></table><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:0 auto 28px auto;\"><tr><td align=\"center\" style=\"background-color:#2e7d32;border-radius:6px;\"><a href=\"{{ $json.cardUpdateUrl }}\" target=\"_blank\" style=\"display:inline-block;padding:14px 32px;color:#ffffff;font-size:16px;font-weight:600;text-decoration:none;\">Reactivate My Account →</a></td></tr></table><p style=\"margin:0 0 8px 0;font-size:14px;line-height:1.5;color:#888888;\">We'd love to hear from you — if there's anything we could have done differently, or if there's a reason you decided to move on, just hit reply. We read every response and it genuinely helps us improve.</p><p style=\"margin:0;font-size:14px;line-height:1.5;color:#888888;\">We hope to see you back soon.</p></td></tr><tr><td style=\"padding:24px 40px;border-top:1px solid #eeeeee;\"><p style=\"margin:0;font-size:12px;line-height:1.5;color:#aaaaaa;text-align:center;\">Your subscription has been paused. Reactivate anytime — your data will be waiting for you.</p></td></tr></table></td></tr></table></body></html>",
+        "options": {
+          "replyTo": "={{ $env.REPLY_TO_EMAIL || 'support@yourcompany.com' }}"
+        }
+      },
+      "id": "email-4",
+      "name": "Email: Final / Win-Back (Variant A)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        4440,
+        580
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "SMTP_CREDENTIAL_ID",
+          "name": "SMTP Account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "channel": "={{ $env.SLACK_BILLING_CHANNEL || '#billing-alerts' }}",
+        "text": "={{ $json.slackUrgencyEmoji || '' }} *Payment Failed — Attempt #{{ $json.attemptCount }}*{{ $json.revenueTier === 'high' ? ' 💎 HIGH VALUE' : '' }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        },
+        "attachments": [
+          {
+            "color": "={{ $json.urgencyLevel==='critical'?'#dc3545':$json.urgencyLevel==='high'?'#fd7e14':$json.urgencyLevel==='medium'?'#ffc107':'#17a2b8' }}",
+            "fields": {
+              "item": [
+                {
+                  "title": "Customer",
+                  "value": "={{ $json.customerName }} ({{ $json.customerEmail }})",
+                  "short": true
+                },
+                {
+                  "title": "Amount at Risk",
+                  "value": "={{ $json.currency }} {{ $json.amountDue }}",
+                  "short": true
+                },
+                {
+                  "title": "Failure Stage",
+                  "value": "={{ $json.failureStage.replace('_',' ').toUpperCase() }}",
+                  "short": true
+                },
+                {
+                  "title": "Reason",
+                  "value": "={{ $json.failureReason }}",
+                  "short": true
+                },
+                {
+                  "title": "Revenue Tier",
+                  "value": "={{ $json.revenueTier.toUpperCase() }}",
+                  "short": true
+                },
+                {
+                  "title": "Action Taken",
+                  "value": "={{ $json.nextAction.replace(/_/g,' ').toUpperCase() }} email sent",
+                  "short": false
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "id": "slack-alert",
+      "name": "Slack: Alert Team",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        4780,
+        100
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_CREDENTIAL_ID",
+          "name": "Slack Account",
+          "_note": "REPLACE_WITH_YOUR_SLACK_CREDENTIAL_ID - Create Slack OAuth2 credential in n8n first (Settings > Credentials)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst d = $input.first().json;\nconst sbUrl = $env.SUPABASE_URL; const sbKey = $env.SUPABASE_SERVICE_KEY;\nconst h = { apikey:sbKey, Authorization:'Bearer '+sbKey, 'Content-Type':'application/json', Prefer:'return=minimal' };\ntry {\n  // SECURITY: encodeURIComponent() prevents URL injection via eventId\n  await this.helpers.httpRequest({ method:'PATCH', url: sbUrl+'/rest/v1/dunning_events?stripe_event_id=eq.'+encodeURIComponent(d.eventId), headers:h, body:{last_email_sent_at: new Date().toISOString()} });\n  await this.helpers.httpRequest({ method:'PATCH', url: sbUrl+'/rest/v1/payment_events?stripe_event_id=eq.'+encodeURIComponent(d.eventId), headers:h, body:{status:'processed'} });\n  await this.helpers.httpRequest({ method:'PATCH', url: sbUrl+'/rest/v1/dunning_events?stripe_event_id=eq.'+encodeURIComponent(d.eventId), headers:h, body:{failure_stage: d.failureStage} });\n  await this.helpers.httpRequest({ method:'PATCH', url: sbUrl+'/rest/v1/dunning_events?stripe_invoice_id=eq.'+encodeURIComponent(d.invoiceId), headers:h, body:{last_dunning_stage_reached: d.failureStage || null} });\n} catch(e) {\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: sbUrl + '/rest/v1/failed_integrations',\n      headers: h,\n      body: {\n        operation_type: 'supabase_write',\n        node_name: 'Finalize Failed Event',\n        error_message: e.message || 'Unknown error',\n        payload: $input.first().json,\n        retry_count: 0,\n        status: 'failed'\n      }\n    });\n  } catch(innerErr) {\n    // Fail silently — never block main flow\n  }\n}\nreturn $input.all();"
+      },
+      "id": "finalize-failed",
+      "name": "Finalize Failed Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5080,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "_note": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID - Create sheet in Google Drive, then add Google Sheets OAuth2 credential in n8n",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Recovery Tracker",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Timestamp": "={{ $json.processedAt }}",
+            "Customer Email": "={{ $json.customerEmail }}",
+            "Customer Name": "={{ $json.customerName }}",
+            "Amount (Currency)": "={{ $json.currency }} {{ $json.amountDue }}",
+            "Attempt #": "={{ $json.attemptCount }}",
+            "Failure Stage": "={{ $json.failureStage }}",
+            "Urgency": "={{ $json.urgencyLevel }}",
+            "Failure Reason": "={{ $json.failureReason }}",
+            "Action Taken": "={{ $json.nextAction }}",
+            "Invoice URL": "={{ $json.invoiceUrl }}",
+            "Event ID": "={{ $json.eventId }}",
+            "Revenue Tier": "={{ $json.revenueTier }}",
+            "Status": "PENDING_RECOVERY"
+          },
+          "matchingColumns": []
+        },
+        "options": {}
+      },
+      "id": "sheets-failed",
+      "name": "Google Sheets: Log Event",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        5380,
+        100
+      ],
+      "notes": "Optional node — safe to disable. Core data is in Supabase. Google OAuth tokens expire periodically; re-authenticate in n8n credentials if this node fails.",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets Account",
+          "_note": "REPLACE_WITH_YOUR_GOOGLE_SHEETS_CREDENTIAL_ID - Create Google Sheets OAuth2 API credential in n8n first (Settings > Credentials)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst event = $input.first().json.body;\nconst invoice = event.data.object;\nconst amountPaid = (invoice.amount_paid || 0) / 100;\nconst currency = (invoice.currency || 'usd').toUpperCase();\n// BUG FIX: Null-safe fallback chain for customer email and name\nconst customerEmail = invoice.customer_email || invoice.customer?.email || '';\nconst customerName = invoice.customer_name || (invoice.customer && typeof invoice.customer === 'object' ? invoice.customer.name : null) || (customerEmail ? customerEmail.split('@')[0] : 'Customer');\nconst invoiceId = invoice.id || '';\nconst subscriptionId = invoice.subscription || '';\n// Check if this was a previously failed payment (Task 4)\nlet wasPreviouslyFailed = false;\ntry {\n  const sbUrl = $env.SUPABASE_URL; const sbKey = $env.SUPABASE_SERVICE_KEY;\n  // SECURITY: encodeURIComponent() prevents URL injection via invoiceId/subscriptionId\n  const res = await this.helpers.httpRequest({ method:'GET', url: sbUrl+'/rest/v1/dunning_events?stripe_invoice_id=eq.'+encodeURIComponent(invoiceId)+'&status=eq.PENDING_RECOVERY&select=id', headers:{apikey:sbKey,Authorization:'Bearer '+sbKey} });\n  if (!res || res.length === 0) {\n    const res2 = await this.helpers.httpRequest({ method:'GET', url: sbUrl+'/rest/v1/dunning_events?stripe_subscription_id=eq.'+encodeURIComponent(subscriptionId)+'&status=eq.PENDING_RECOVERY&select=id', headers:{apikey:sbKey,Authorization:'Bearer '+sbKey} });\n    wasPreviouslyFailed = res2 && res2.length > 0;\n  } else { wasPreviouslyFailed = true; }\n} catch(e) {}\nreturn [{ json: { customerEmail, customerName, customerId: invoice.customer||'', amountRecovered: amountPaid, currency, invoiceId, subscriptionId, recoveredAt: new Date().toISOString(), eventId: event.id, status:'RECOVERED', wasPreviouslyFailed } }];"
+      },
+      "id": "process-recovery",
+      "name": "Process Recovery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2280,
+        1200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c3",
+              "leftValue": "={{ $json.wasPreviouslyFailed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-was-failed",
+      "name": "IF: Was Previously Failed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2580,
+        1200
+      ]
+    },
+    {
+      "parameters": {
+        "channel": "={{ $env.SLACK_BILLING_CHANNEL || '#billing-alerts' }}",
+        "text": "={{ $json.slackUrgencyEmoji || '' }} 🎉 *Payment Recovered!*\n\n✅ *{{ $json.customerName }}* ({{ $json.customerEmail }}) just paid *{{ $json.currency }} {{ $json.amountRecovered }}*\n\n💰 Revenue saved! The dunning sequence worked.",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "id": "slack-recovery",
+      "name": "Slack: Recovery Celebration 🎉",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        2880,
+        1100
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_CREDENTIAL_ID",
+          "name": "Slack Account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst d = $input.first().json;\nconst sbUrl = $env.SUPABASE_URL; const sbKey = $env.SUPABASE_SERVICE_KEY;\nconst h = { apikey:sbKey, Authorization:'Bearer '+sbKey, 'Content-Type':'application/json', Prefer:'return=minimal' };\ntry {\n  // SECURITY: encodeURIComponent() prevents URL injection via subscriptionId and eventId\n  await this.helpers.httpRequest({ method:'PATCH', url: sbUrl+'/rest/v1/dunning_events?stripe_subscription_id=eq.'+encodeURIComponent(d.subscriptionId)+'&status=eq.PENDING_RECOVERY', headers:h, body:{status:'RECOVERED'} });\n  await this.helpers.httpRequest({ method:'PATCH', url: sbUrl+'/rest/v1/payment_events?stripe_event_id=eq.'+encodeURIComponent(d.eventId), headers:h, body:{status:'processed'} });\n} catch(e) {\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: sbUrl + '/rest/v1/failed_integrations',\n      headers: h,\n      body: {\n        operation_type: 'supabase_write',\n        node_name: 'Finalize Recovery',\n        error_message: e.message || 'Unknown error',\n        payload: $input.first().json,\n        retry_count: 0,\n        status: 'failed'\n      }\n    });\n  } catch(innerErr) {\n    // Fail silently — never block main flow\n  }\n}\nreturn $input.all();"
+      },
+      "id": "finalize-recovery",
+      "name": "Finalize Recovery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3180,
+        1100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "_note": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID - Create in n8n credentials first",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Recovery Tracker",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Timestamp": "={{ $json.recoveredAt }}",
+            "Customer Email": "={{ $json.customerEmail }}",
+            "Customer Name": "={{ $json.customerName }}",
+            "Amount (Currency)": "={{ $json.currency }} {{ $json.amountRecovered }}",
+            "Attempt #": "RECOVERED",
+            "Failure Stage": "RECOVERED",
+            "Urgency": "none",
+            "Failure Reason": "N/A — Payment Successful",
+            "Action Taken": "none — auto-recovered",
+            "Invoice URL": "",
+            "Event ID": "={{ $json.eventId }}",
+            "Revenue Tier": "",
+            "Status": "RECOVERED"
+          },
+          "matchingColumns": []
+        },
+        "options": {}
+      },
+      "id": "sheets-recovery",
+      "name": "Google Sheets: Log Recovery",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        3480,
+        1100
+      ],
+      "notes": "Optional node — safe to disable. Core data is in Supabase. Google OAuth tokens expire periodically; re-authenticate in n8n credentials if this node fails.",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets Account",
+          "_note": "REPLACE_WITH_YOUR_GOOGLE_SHEETS_CREDENTIAL_ID - Create Google Sheets OAuth2 API credential in n8n first"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst d = $input.first().json;\ntry {\n  const sbUrl = $env.SUPABASE_URL; const sbKey = $env.SUPABASE_SERVICE_KEY;\n  // SECURITY: encodeURIComponent() prevents URL injection via eventId\n  await this.helpers.httpRequest({ method:'PATCH', url: sbUrl+'/rest/v1/payment_events?stripe_event_id=eq.'+encodeURIComponent(d.eventId), headers:{ apikey:sbKey, Authorization:'Bearer '+sbKey, 'Content-Type':'application/json', Prefer:'return=minimal' }, body:{status:'processed'} });\n} catch(e) {}\nreturn $input.all();"
+      },
+      "id": "skip-normal",
+      "name": "Skip: Normal Payment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        1350
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst event = $input.first().json.body;\ntry {\n  const sub = event.data.object;\n  const customerEmail = sub.customer_email || '';\n  const customerName = sub.customer_name || (customerEmail ? customerEmail.split('@')[0] : 'Customer');\n  const cancelReason = sub.cancellation_details?.reason || 'payment_failure';\n  const items = sub.items?.data || [];\n  let monthlyRevenueLost = 0;\n  for (const item of items) { const p = item.price; if (p) { let a = (p.unit_amount||0)/100; if (p.recurring?.interval==='year') a=a/12; monthlyRevenueLost += a; } }\n  const currency = (sub.currency || 'usd').toUpperCase();\n  let revenueTier = 'low';\n  if (monthlyRevenueLost >= 100) revenueTier = 'high';\n  else if (monthlyRevenueLost >= 20) revenueTier = 'mid';\n  return [{ json: { customerEmail, customerName, customerId:sub.customer||'', subscriptionId:sub.id||'', monthlyRevenueLost, currency, cancelReason, revenueTier, cancelledAt:new Date().toISOString(), eventId:event.id, status:'CHURNED' } }];\n} catch (e) {\n  try {\n    const sbUrl = $env.SUPABASE_URL;\n    const sbKey = $env.SUPABASE_SERVICE_KEY;\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: sbUrl + '/rest/v1/failed_integrations',\n      headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey, 'Content-Type': 'application/json', Prefer: 'return=minimal' },\n      body: { operation_type: 'churn_processing', node_name: 'Process Churn Event', error_message: e.message || 'Unknown error', payload: event, retry_count: 0, status: 'failed' }\n    });\n  } catch (innerErr) {}\n  return [{ json: { error: e.message } }];\n}"
+      },
+      "id": "process-churn",
+      "name": "Process Churn Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2280,
+        1700
+      ]
+    },
+    {
+      "parameters": {
+        "channel": "={{ $env.SLACK_BILLING_CHANNEL || '#billing-alerts' }}",
+        "text": "={{ $json.slackUrgencyEmoji || '' }} ❌ *Customer Churned — Subscription Cancelled*{{ $json.revenueTier === 'high' ? ' 💎 HIGH VALUE CUSTOMER' : '' }}\n\n😔 *{{ $json.customerName }}* ({{ $json.customerEmail }}) has been lost.\n\n💸 *Monthly revenue lost:* {{ $json.currency }} {{ $json.monthlyRevenueLost }}\n📋 *Reason:* {{ $json.cancelReason }}\n\nConsider reaching out personally to win them back.",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "id": "slack-churn",
+      "name": "Slack: Churn Alert ❌",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        2580,
+        1700
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_CREDENTIAL_ID",
+          "name": "Slack Account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst sbUrl = $env.SUPABASE_URL;\nconst sbKey = $env.SUPABASE_SERVICE_KEY;\nconst h = {\n  apikey: sbKey,\n  Authorization: 'Bearer ' + sbKey,\n  'Content-Type': 'application/json',\n  Prefer: 'return=minimal'\n};\n\ntry {\n  await this.helpers.httpRequest({\n    method: 'POST',\n    url: sbUrl + '/rest/v1/churn_events',\n    headers: h,\n    body: {\n      stripe_subscription_id: d.subscriptionId,\n      stripe_customer_id: d.customerId,\n      customer_email: d.customerEmail,\n      customer_name: d.customerName,\n      monthly_revenue_lost: d.monthlyRevenueLost,\n      currency: d.currency,\n      cancel_reason: d.cancelReason,\n      revenue_tier: d.revenueTier,\n      stripe_event_id: d.eventId,\n      cancelled_at: d.cancelledAt\n    }\n  });\n  // SECURITY: encodeURIComponent() prevents URL injection via eventId\n  await this.helpers.httpRequest({\n    method: 'PATCH',\n    url: sbUrl + '/rest/v1/payment_events?stripe_event_id=eq.' + encodeURIComponent(d.eventId),\n    headers: h,\n    body: { status: 'processed' }\n  });\n  await this.helpers.httpRequest({\n    method: 'PATCH',\n    url: sbUrl + '/rest/v1/dunning_events?stripe_event_id=eq.' + encodeURIComponent(d.eventId),\n    headers: h,\n    body: { failure_stage: d.failureStage || 'final_failure' }\n  });\n} catch(e) {\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: sbUrl + '/rest/v1/failed_integrations',\n      headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey, 'Content-Type': 'application/json', Prefer: 'return=minimal' },\n      body: { operation_type: 'supabase_write', node_name: 'Finalize Churn', error_message: e.message || 'Unknown error', payload: $input.first().json, retry_count: 0, status: 'failed' }\n    });\n  } catch(innerErr) {}\n}\n\nreturn $input.all();"
+      },
+      "id": "finalize-churn",
+      "name": "Finalize Churn",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        1700
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "_note": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID - Create in n8n credentials first",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Recovery Tracker",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Timestamp": "={{ $json.cancelledAt }}",
+            "Customer Email": "={{ $json.customerEmail }}",
+            "Customer Name": "={{ $json.customerName }}",
+            "Amount (Currency)": "={{ $json.currency }} {{ $json.monthlyRevenueLost }}/mo LOST",
+            "Attempt #": "CANCELLED",
+            "Failure Stage": "CHURNED",
+            "Urgency": "critical",
+            "Failure Reason": "={{ $json.cancelReason }}",
+            "Action Taken": "subscription_cancelled",
+            "Invoice URL": "",
+            "Event ID": "={{ $json.eventId }}",
+            "Revenue Tier": "={{ $json.revenueTier }}",
+            "Status": "CHURNED"
+          },
+          "matchingColumns": []
+        },
+        "options": {}
+      },
+      "id": "sheets-churn",
+      "name": "Google Sheets: Log Churn",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        3180,
+        1700
+      ],
+      "notes": "Optional node — safe to disable. Core data is in Supabase. Google OAuth tokens expire periodically; re-authenticate in n8n credentials if this node fails.",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets Account",
+          "_note": "REPLACE_WITH_YOUR_GOOGLE_SHEETS_CREDENTIAL_ID - Create Google Sheets OAuth2 API credential in n8n first"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst sbUrl = $env.SUPABASE_URL;\nconst sbKey = $env.SUPABASE_SERVICE_KEY;\n// IMPROVEMENT: Email validation — skip sending if customer email is invalid\nconst emailValid = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(d.customerEmail || '');\nlet stillPending = true;\ntry {\n  // SECURITY: encodeURIComponent() prevents URL injection via invoiceId\n  const res = await this.helpers.httpRequest({\n    method: 'GET',\n    url: sbUrl + '/rest/v1/dunning_events?stripe_invoice_id=eq.' + encodeURIComponent(d.invoiceId) + '&select=status&order=created_at.desc&limit=1',\n    headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey }\n  });\n  if (res && res.length > 0 && res[0].status !== 'PENDING_RECOVERY') {\n    stillPending = false;\n  }\n  if (stillPending) {\n    await this.helpers.httpRequest({\n      method: 'PATCH',\n      url: sbUrl + '/rest/v1/dunning_events?stripe_event_id=eq.' + encodeURIComponent(d.eventId),\n      headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey, 'Content-Type': 'application/json', Prefer: 'return=minimal' },\n      body: { failure_stage: d.failureStage }\n    });\n    await this.helpers.httpRequest({\n      method: 'PATCH',\n      url: sbUrl + '/rest/v1/dunning_events?stripe_invoice_id=eq.' + encodeURIComponent(d.invoiceId),\n      headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey, 'Content-Type': 'application/json', Prefer: 'return=minimal' },\n      body: { last_dunning_stage_reached: d.failureStage || null }\n    });\n  }\n} catch(e) {}\n// Skip sending if email is invalid — propagate emailValid flag\nreturn [{ json: { ...d, stillPending: stillPending && emailValid, emailValid } }];"
+      },
+      "id": "check-unpaid-2",
+      "name": "Check: Still Unpaid? (Stage 2)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3540,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c-still-pending-2",
+              "leftValue": "={{ $json.stillPending }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-still-pending-2",
+      "name": "IF: Still Pending? (Stage 2)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3840,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "console.log('[Skip] Invoice already recovered, skipping stage. invoiceId:', $input.first().json.invoiceId || 'unknown');\nreturn $input.all();"
+      },
+      "id": "skip-recovered-2",
+      "name": "Skip: Already Recovered (Stage 2)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4140,
+        -300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst sbUrl = $env.SUPABASE_URL;\nconst sbKey = $env.SUPABASE_SERVICE_KEY;\n// IMPROVEMENT: Email validation — skip sending if customer email is invalid\nconst emailValid = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(d.customerEmail || '');\nlet stillPending = true;\ntry {\n  // SECURITY: encodeURIComponent() prevents URL injection via invoiceId\n  const res = await this.helpers.httpRequest({\n    method: 'GET',\n    url: sbUrl + '/rest/v1/dunning_events?stripe_invoice_id=eq.' + encodeURIComponent(d.invoiceId) + '&select=status&order=created_at.desc&limit=1',\n    headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey }\n  });\n  if (res && res.length > 0 && res[0].status !== 'PENDING_RECOVERY') {\n    stillPending = false;\n  }\n  if (stillPending) {\n    await this.helpers.httpRequest({\n      method: 'PATCH',\n      url: sbUrl + '/rest/v1/dunning_events?stripe_event_id=eq.' + encodeURIComponent(d.eventId),\n      headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey, 'Content-Type': 'application/json', Prefer: 'return=minimal' },\n      body: { failure_stage: d.failureStage }\n    });\n    await this.helpers.httpRequest({\n      method: 'PATCH',\n      url: sbUrl + '/rest/v1/dunning_events?stripe_invoice_id=eq.' + encodeURIComponent(d.invoiceId),\n      headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey, 'Content-Type': 'application/json', Prefer: 'return=minimal' },\n      body: { last_dunning_stage_reached: d.failureStage || null }\n    });\n  }\n} catch(e) {}\n// Skip sending if email is invalid — propagate emailValid flag\nreturn [{ json: { ...d, stillPending: stillPending && emailValid, emailValid } }];"
+      },
+      "id": "check-unpaid-3",
+      "name": "Check: Still Unpaid? (Stage 3)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c-still-pending-3",
+              "leftValue": "={{ $json.stillPending }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-still-pending-3",
+      "name": "IF: Still Pending? (Stage 3)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3840,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "console.log('[Skip] Invoice already recovered, skipping stage. invoiceId:', $input.first().json.invoiceId || 'unknown');\nreturn $input.all();"
+      },
+      "id": "skip-recovered-3",
+      "name": "Skip: Already Recovered (Stage 3)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4140,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst sbUrl = $env.SUPABASE_URL;\nconst sbKey = $env.SUPABASE_SERVICE_KEY;\n// IMPROVEMENT: Email validation — skip sending if customer email is invalid\nconst emailValid = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(d.customerEmail || '');\nlet stillPending = true;\ntry {\n  // SECURITY: encodeURIComponent() prevents URL injection via invoiceId\n  const res = await this.helpers.httpRequest({\n    method: 'GET',\n    url: sbUrl + '/rest/v1/dunning_events?stripe_invoice_id=eq.' + encodeURIComponent(d.invoiceId) + '&select=status&order=created_at.desc&limit=1',\n    headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey }\n  });\n  if (res && res.length > 0 && res[0].status !== 'PENDING_RECOVERY') {\n    stillPending = false;\n  }\n  if (stillPending) {\n    await this.helpers.httpRequest({\n      method: 'PATCH',\n      url: sbUrl + '/rest/v1/dunning_events?stripe_event_id=eq.' + encodeURIComponent(d.eventId),\n      headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey, 'Content-Type': 'application/json', Prefer: 'return=minimal' },\n      body: { failure_stage: d.failureStage }\n    });\n    await this.helpers.httpRequest({\n      method: 'PATCH',\n      url: sbUrl + '/rest/v1/dunning_events?stripe_invoice_id=eq.' + encodeURIComponent(d.invoiceId),\n      headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey, 'Content-Type': 'application/json', Prefer: 'return=minimal' },\n      body: { last_dunning_stage_reached: d.failureStage || null }\n    });\n  }\n} catch(e) {}\n// Skip sending if email is invalid — propagate emailValid flag\nreturn [{ json: { ...d, stillPending: stillPending && emailValid, emailValid } }];"
+      },
+      "id": "check-unpaid-4",
+      "name": "Check: Still Unpaid? (Stage 4)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3540,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c-still-pending-4",
+              "leftValue": "={{ $json.stillPending }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-still-pending-4",
+      "name": "IF: Still Pending? (Stage 4)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3840,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "console.log('[Skip] Invoice already recovered, skipping stage. invoiceId:', $input.first().json.invoiceId || 'unknown');\nreturn $input.all();"
+      },
+      "id": "skip-recovered-4",
+      "name": "Skip: Already Recovered (Stage 4)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4140,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SENDER_EMAIL || 'billing@yourcompany.com' }}",
+        "toEmail": "={{ $json.customerEmail }}",
+        "subject": "quick heads up — payment didn't go through",
+        "emailType": "html",
+        "html": "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"></head><body style=\"margin:0;padding:0;background-color:#f4f6f9;font-family:Arial,Helvetica,sans-serif;\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#f4f6f9;padding:40px 0;\"><tr><td align=\"center\"><table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.06);\"><tr><td style=\"padding:36px 40px 20px 40px;\"><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">Hey {{ $json.customerName }} 👋</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">Just a quick heads up — your payment of <strong>{{ $json.amountDue }} {{ $json.currency }}</strong> didn't go through.</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">Happens all the time. Expired card, bank being cautious, the usual stuff. Nothing to stress about.</p><p style=\"margin:0 0 24px 0;font-size:16px;line-height:1.6;color:#333333;\">It's a 30-second fix:</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:0 auto 28px auto;\"><tr><td align=\"center\" style=\"background-color:#3b5bdb;border-radius:6px;\"><a href=\"{{ $json.cardUpdateUrl }}\" target=\"_blank\" style=\"display:inline-block;padding:14px 32px;color:#ffffff;font-size:16px;font-weight:600;text-decoration:none;\">Fix my payment →</a></td></tr></table><p style=\"margin:0;font-size:14px;line-height:1.5;color:#888888;\">That's it. Thanks for being here 🙏</p></td></tr><tr><td style=\"padding:24px 40px;border-top:1px solid #eeeeee;\"><p style=\"margin:0;font-size:12px;line-height:1.5;color:#aaaaaa;text-align:center;\">Automated payment notice</p></td></tr></table></td></tr></table></body></html>",
+        "options": {
+          "replyTo": "={{ $env.REPLY_TO_EMAIL || 'support@yourcompany.com' }}"
+        }
+      },
+      "id": "email-1-b",
+      "name": "Email: Friendly Reminder (Variant B)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        4440,
+        -380
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "SMTP_CREDENTIAL_ID",
+          "name": "SMTP Account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c-variant-1",
+              "leftValue": "={{ $json.templateVariant }}",
+              "rightValue": "A",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-variant-1",
+      "name": "IF: Variant A or B? (Stage 1)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4140,
+        -500
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SENDER_EMAIL || 'billing@yourcompany.com' }}",
+        "toEmail": "={{ $json.customerEmail }}",
+        "subject": "still failing — want us to help sort this?",
+        "emailType": "html",
+        "html": "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"></head><body style=\"margin:0;padding:0;background-color:#f4f6f9;font-family:Arial,Helvetica,sans-serif;\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#f4f6f9;padding:40px 0;\"><tr><td align=\"center\"><table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.06);\"><tr><td style=\"padding:36px 40px 20px 40px;\"><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">Hey {{ $json.customerName }},</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">We tried charging your card again for <strong>{{ $json.amountDue }} {{ $json.currency }}</strong> — still no luck.</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">Your account is still active and everything's working fine. But we do need this sorted before the next retry, or we'll have to pause things on our end.</p><p style=\"margin:0 0 24px 0;font-size:16px;line-height:1.6;color:#333333;\">Quickest way to fix it:</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:0 auto 28px auto;\"><tr><td align=\"center\" style=\"background-color:#e67e22;border-radius:6px;\"><a href=\"{{ $json.cardUpdateUrl }}\" target=\"_blank\" style=\"display:inline-block;padding:14px 32px;color:#ffffff;font-size:16px;font-weight:600;text-decoration:none;\">Update my card ✏️</a></td></tr></table><p style=\"margin:0;font-size:14px;line-height:1.5;color:#888888;\">Having trouble? Just reply to this email — we read every one.</p></td></tr><tr><td style=\"padding:24px 40px;border-top:1px solid #eeeeee;\"><p style=\"margin:0;font-size:12px;line-height:1.5;color:#aaaaaa;text-align:center;\">Second payment notice for {{ $json.amountDue }} {{ $json.currency }}</p></td></tr></table></td></tr></table></body></html>",
+        "options": {
+          "replyTo": "={{ $env.REPLY_TO_EMAIL || 'support@yourcompany.com' }}"
+        }
+      },
+      "id": "email-2-b",
+      "name": "Email: Update Card Request (Variant B)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        4440,
+        20
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "SMTP_CREDENTIAL_ID",
+          "name": "SMTP Account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c-variant-2",
+              "leftValue": "={{ $json.templateVariant }}",
+              "rightValue": "A",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-variant-2",
+      "name": "IF: Variant A or B? (Stage 2)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4140,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SENDER_EMAIL || 'billing@yourcompany.com' }}",
+        "toEmail": "={{ $json.customerEmail }}",
+        "subject": "we really don't want to lose you — 2 mins to fix this",
+        "emailType": "html",
+        "html": "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"></head><body style=\"margin:0;padding:0;background-color:#f4f6f9;font-family:Arial,Helvetica,sans-serif;\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#f4f6f9;padding:40px 0;\"><tr><td align=\"center\"><table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.06);\"><tr><td style=\"padding:36px 40px 20px 40px;\"><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">Hey {{ $json.customerName }},</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">I'll be straight with you — this is the last step before we have to pause your account.</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">Your payment of <strong>{{ $json.amountDue }} {{ $json.currency }}</strong> has now failed three times. We've held off as long as we can, but our billing system will automatically suspend access after this.</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">If you're going through a tough stretch right now, just reply and tell us. We're real people and we're happy to work something out. Seriously.</p><p style=\"margin:0 0 24px 0;font-size:16px;line-height:1.6;color:#333333;\">Otherwise, two minutes is all it takes:</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:0 auto 28px auto;\"><tr><td align=\"center\" style=\"background-color:#c0392b;border-radius:6px;\"><a href=\"{{ $json.cardUpdateUrl }}\" target=\"_blank\" style=\"display:inline-block;padding:14px 32px;color:#ffffff;font-size:16px;font-weight:600;text-decoration:none;\">Keep my account running →</a></td></tr></table><p style=\"margin:0;font-size:14px;line-height:1.5;color:#888888;\">We really don't want to see you go.</p></td></tr><tr><td style=\"padding:24px 40px;border-top:1px solid #eeeeee;\"><p style=\"margin:0;font-size:12px;line-height:1.5;color:#aaaaaa;text-align:center;\">Final payment notice before account suspension</p></td></tr></table></td></tr></table></body></html>",
+        "options": {
+          "replyTo": "={{ $env.REPLY_TO_EMAIL || 'support@yourcompany.com' }}"
+        }
+      },
+      "id": "email-3-b",
+      "name": "Email: Urgent Warning (Variant B)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        4440,
+        420
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "SMTP_CREDENTIAL_ID",
+          "name": "SMTP Account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c-variant-3",
+              "leftValue": "={{ $json.templateVariant }}",
+              "rightValue": "A",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-variant-3",
+      "name": "IF: Variant A or B? (Stage 3)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4140,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SENDER_EMAIL || 'billing@yourcompany.com' }}",
+        "toEmail": "={{ $json.customerEmail }}",
+        "subject": "your account's paused — but you can come back anytime",
+        "emailType": "html",
+        "html": "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"></head><body style=\"margin:0;padding:0;background-color:#f4f6f9;font-family:Arial,Helvetica,sans-serif;\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#f4f6f9;padding:40px 0;\"><tr><td align=\"center\"><table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"background-color:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.06);\"><tr><td style=\"padding:36px 40px 20px 40px;\"><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">Hey {{ $json.customerName }},</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">Your subscription has been paused. No drama, no hard feelings.</p><p style=\"margin:0 0 18px 0;font-size:16px;line-height:1.6;color:#333333;\">Your data is 100% safe — all your workflows, settings, and history are exactly where you left them. Nothing gets deleted.</p><p style=\"margin:0 0 24px 0;font-size:16px;line-height:1.6;color:#333333;\">Whenever you're ready to come back, it's a one-click thing:</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:0 auto 28px auto;\"><tr><td align=\"center\" style=\"background-color:#27ae60;border-radius:6px;\"><a href=\"{{ $json.cardUpdateUrl }}\" target=\"_blank\" style=\"display:inline-block;padding:14px 32px;color:#ffffff;font-size:16px;font-weight:600;text-decoration:none;\">Come back 🌱</a></td></tr></table><p style=\"margin:0 0 12px 0;font-size:14px;line-height:1.5;color:#888888;\">One last thing — if there's a reason you decided to leave, we'd genuinely love to hear it. No survey, no form. Just hit reply and tell us in a sentence. It helps more than you'd think.</p><p style=\"margin:0;font-size:14px;line-height:1.5;color:#888888;\">Take care,<br>The team</p></td></tr><tr><td style=\"padding:24px 40px;border-top:1px solid #eeeeee;\"><p style=\"margin:0;font-size:12px;line-height:1.5;color:#aaaaaa;text-align:center;\">Your subscription is paused. Come back anytime — we'll keep the lights on for you.</p></td></tr></table></td></tr></table></body></html>",
+        "options": {
+          "replyTo": "={{ $env.REPLY_TO_EMAIL || 'support@yourcompany.com' }}"
+        }
+      },
+      "id": "email-4-b",
+      "name": "Email: Final / Win-Back (Variant B)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        4440,
+        820
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "SMTP_CREDENTIAL_ID",
+          "name": "SMTP Account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c-variant-4",
+              "leftValue": "={{ $json.templateVariant }}",
+              "rightValue": "A",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-variant-4",
+      "name": "IF: Variant A or B? (Stage 4)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4140,
+        700
+      ]
+    }
+  ],
+  "connections": {
+    "Stripe Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Verify Stripe Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Stripe Signature": {
+      "main": [
+        [
+          {
+            "node": "IF: Signature Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Signature Valid?": {
+      "main": [
+        [
+          {
+            "node": "Idempotency Check",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject Invalid Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Idempotency Check": {
+      "main": [
+        [
+          {
+            "node": "IF: New Event?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: New Event?": {
+      "main": [
+        [
+          {
+            "node": "Respond: Accepted",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: Already Processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond: Accepted": {
+      "main": [
+        [
+          {
+            "node": "Route by Event Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Event Type": {
+      "main": [
+        [
+          {
+            "node": "Classify Failure & Extract Data",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Process Recovery",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Process Churn Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Failure & Extract Data": {
+      "main": [
+        [
+          {
+            "node": "Save Dunning to Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Dunning to Supabase": {
+      "main": [
+        [
+          {
+            "node": "Route Dunning Stage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Dunning Stage": {
+      "main": [
+        [
+          {
+            "node": "Wait: Stage 1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait: Stage 2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait: Stage 3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait: Stage 4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait: Stage 1": {
+      "main": [
+        [
+          {
+            "node": "Check: Still Unpaid? (Stage 1)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait: Stage 2": {
+      "main": [
+        [
+          {
+            "node": "Check: Still Unpaid? (Stage 2)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait: Stage 3": {
+      "main": [
+        [
+          {
+            "node": "Check: Still Unpaid? (Stage 3)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait: Stage 4": {
+      "main": [
+        [
+          {
+            "node": "Check: Still Unpaid? (Stage 4)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: Alert Team": {
+      "main": [
+        [
+          {
+            "node": "Finalize Failed Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize Failed Event": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets: Log Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Recovery": {
+      "main": [
+        [
+          {
+            "node": "IF: Was Previously Failed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Was Previously Failed?": {
+      "main": [
+        [
+          {
+            "node": "Slack: Recovery Celebration 🎉",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip: Normal Payment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: Recovery Celebration 🎉": {
+      "main": [
+        [
+          {
+            "node": "Finalize Recovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize Recovery": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets: Log Recovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Churn Event": {
+      "main": [
+        [
+          {
+            "node": "Slack: Churn Alert ❌",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: Churn Alert ❌": {
+      "main": [
+        [
+          {
+            "node": "Finalize Churn",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize Churn": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets: Log Churn",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check: Still Unpaid? (Stage 2)": {
+      "main": [
+        [
+          {
+            "node": "IF: Still Pending? (Stage 2)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Still Pending? (Stage 2)": {
+      "main": [
+        [
+          {
+            "node": "IF: Variant A or B? (Stage 2)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip: Already Recovered (Stage 2)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check: Still Unpaid? (Stage 3)": {
+      "main": [
+        [
+          {
+            "node": "IF: Still Pending? (Stage 3)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Still Pending? (Stage 3)": {
+      "main": [
+        [
+          {
+            "node": "IF: Variant A or B? (Stage 3)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip: Already Recovered (Stage 3)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check: Still Unpaid? (Stage 4)": {
+      "main": [
+        [
+          {
+            "node": "IF: Still Pending? (Stage 4)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Still Pending? (Stage 4)": {
+      "main": [
+        [
+          {
+            "node": "IF: Variant A or B? (Stage 4)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip: Already Recovered (Stage 4)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Variant A or B? (Stage 1)": {
+      "main": [
+        [
+          {
+            "node": "Email: Friendly Reminder (Variant A)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Email: Friendly Reminder (Variant B)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Friendly Reminder (Variant A)": {
+      "main": [
+        [
+          {
+            "node": "Slack: Alert Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Friendly Reminder (Variant B)": {
+      "main": [
+        [
+          {
+            "node": "Slack: Alert Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Variant A or B? (Stage 2)": {
+      "main": [
+        [
+          {
+            "node": "Email: Update Card Request (Variant A)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Email: Update Card Request (Variant B)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Update Card Request (Variant A)": {
+      "main": [
+        [
+          {
+            "node": "Slack: Alert Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Update Card Request (Variant B)": {
+      "main": [
+        [
+          {
+            "node": "Slack: Alert Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Variant A or B? (Stage 3)": {
+      "main": [
+        [
+          {
+            "node": "Email: Urgent Warning (Variant A)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Email: Urgent Warning (Variant B)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Urgent Warning (Variant A)": {
+      "main": [
+        [
+          {
+            "node": "Slack: Alert Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Urgent Warning (Variant B)": {
+      "main": [
+        [
+          {
+            "node": "Slack: Alert Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Variant A or B? (Stage 4)": {
+      "main": [
+        [
+          {
+            "node": "Email: Final / Win-Back (Variant A)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Email: Final / Win-Back (Variant B)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Final / Win-Back (Variant A)": {
+      "main": [
+        [
+          {
+            "node": "Slack: Alert Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Final / Win-Back (Variant B)": {
+      "main": [
+        [
+          {
+            "node": "Slack: Alert Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check: Still Unpaid? (Stage 1)": {
+      "main": [
+        [
+          {
+            "node": "IF: Still Pending? (Stage 1)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Still Pending? (Stage 1)": {
+      "main": [
+        [
+          {
+            "node": "IF: Variant A or B? (Stage 1)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip: Already Recovered (Stage 1)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "SET_YOUR_ERROR_WORKFLOW_ID_HERE"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "billing",
+      "id": "tag-billing"
+    },
+    {
+      "name": "churn-prevention",
+      "id": "tag-churn"
+    },
+    {
+      "name": "stripe",
+      "id": "tag-stripe"
+    },
+    {
+      "name": "revenue-recovery",
+      "id": "tag-recovery"
+    },
+    {
+      "name": "supabase",
+      "id": "tag-supabase"
+    }
+  ],
+  "pinData": {},
+  "versionId": "2.1.1"
+}
